@@ -20,6 +20,12 @@ const CONFIG = {
 // Request cache (simple in-memory)
 const requestCache = new Map();
 
+// Counters
+let requestCount = 0;
+let gpsRequestCount = 0;
+let cacheHits = 0;
+let cacheMisses = 0;
+
 // Logging function
 function log(message, type = 'INFO') {
     const timestamp = new Date().toISOString();
@@ -78,8 +84,41 @@ function generateCacheKey(req) {
     return `${req.method}:${req.url}:${req.headers['content-type'] || ''}`;
 }
 
+// Detect GPS protocol from data
+function detectGPSProtocol(buffer) {
+    if (!buffer || buffer.length === 0) return 'UNKNOWN';
+    
+    // Check hex patterns
+    const hexStart = buffer.toString('hex', 0, Math.min(10, buffer.length));
+    
+    // GT06 protocol starts with 7878 or 7979
+    if (hexStart.startsWith('7878') || hexStart.startsWith('7979')) {
+        return 'GT06';
+    }
+    
+    // Check ASCII for other protocols
+    const asciiStart = buffer.toString('ascii', 0, Math.min(50, buffer.length));
+    
+    // TK103 often contains "imei" or "##"
+    if (asciiStart.includes('imei') || asciiStart.includes('##') || asciiStart.includes('IMSI')) {
+        return 'TK103';
+    }
+    
+    // NMEA sentences
+    if (asciiStart.includes('GPRMC') || asciiStart.includes('GPGGA')) {
+        return 'NMEA';
+    }
+    
+    // GSM AT commands
+    if (asciiStart.includes('AT+') || asciiStart.includes('AT')) {
+        return 'GSM_AT';
+    }
+    
+    return 'UNKNOWN';
+}
+
 // Forward request to target server
-async function forwardRequest(req, res, targetUrl) {
+async function forwardRequest(req, res, targetUrl, bodyBuffer = null) {
     const startTime = Date.now();
     const requestInfo = parseGPSRequest(req);
     
@@ -104,34 +143,44 @@ async function forwardRequest(req, res, targetUrl) {
             if (CONFIG.LOG_REQUESTS) {
                 log(`✓ CACHE HIT: ${req.url}`, 'CACHE');
             }
+            cacheHits++;
             res.writeHead(cached.status, cached.headers);
             res.end(cached.body);
             return;
         }
+        cacheMisses++;
     }
     
-    // Collect request body for POST/PUT
-    let requestBody = [];
-    let bodySize = 0;
+    // Collect request body if not provided
+    let buffer = bodyBuffer;
+    if (!buffer) {
+        let requestBody = [];
+        let bodySize = 0;
+        
+        req.on('data', (chunk) => {
+            bodySize += chunk.length;
+            
+            // Prevent oversized requests
+            if (bodySize > CONFIG.MAX_BODY_SIZE) {
+                log(`Request too large: ${bodySize} bytes from ${requestInfo.ip}`, 'ERROR');
+                res.writeHead(413, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'Request too large' }));
+                req.destroy();
+                return;
+            }
+            
+            requestBody.push(chunk);
+        });
+        
+        req.on('end', () => {
+            buffer = Buffer.concat(requestBody);
+            continueForwarding();
+        });
+    } else {
+        continueForwarding();
+    }
     
-    req.on('data', (chunk) => {
-        bodySize += chunk.length;
-        
-        // Prevent oversized requests
-        if (bodySize > CONFIG.MAX_BODY_SIZE) {
-            log(`Request too large: ${bodySize} bytes from ${requestInfo.ip}`, 'ERROR');
-            res.writeHead(413, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: 'Request too large' }));
-            req.destroy();
-            return;
-        }
-        
-        requestBody.push(chunk);
-    });
-    
-    req.on('end', () => {
-        const buffer = Buffer.concat(requestBody);
-        
+    function continueForwarding() {
         // Prepare forward request options
         const parsedTarget = new URL(targetUrl);
         const isHttps = parsedTarget.protocol === 'https:';
@@ -147,17 +196,28 @@ async function forwardRequest(req, res, targetUrl) {
                 'host': parsedTarget.hostname,
                 'x-forwarded-for': requestInfo.ip,
                 'x-forwarded-proto': isHttps ? 'https' : 'http',
-                'x-proxy-timestamp': new Date().toISOString()
+                'x-proxy-timestamp': new Date().toISOString(),
+                'x-gps-protocol': detectGPSProtocol(buffer)
             },
             timeout: CONFIG.REQUEST_TIMEOUT
         };
         
-        // Log GPS-specific requests
-        if (requestInfo.isGPSDevice) {
-            log(`📡 GPS DEVICE: ${requestInfo.ip} → ${buffer.length} bytes`, 'GPS');
+        // Detect and log GPS data
+        const contentType = req.headers['content-type'] || '';
+        const isGPSDevice = contentType.includes('application/octet-stream') ||
+                           contentType.includes('text/plain') ||
+                           req.method === 'POST' ||
+                           req.url === '/' ||
+                           req.headers['user-agent']?.includes('GPS') ||
+                           detectGPSProtocol(buffer) !== 'UNKNOWN';
+        
+        if (isGPSDevice) {
+            gpsRequestCount++;
+            const protocol = detectGPSProtocol(buffer);
+            log(`📡 GPS DEVICE: ${requestInfo.ip} → ${buffer?.length || 0} bytes (Protocol: ${protocol})`, 'GPS');
             
             // Log first 100 chars of GPS data (for debugging)
-            if (buffer.length > 0) {
+            if (buffer && buffer.length > 0) {
                 const preview = buffer.toString('hex', 0, Math.min(100, buffer.length));
                 log(`GPS Data (hex preview): ${preview}...`, 'GPS-DATA');
             }
@@ -182,7 +242,8 @@ async function forwardRequest(req, res, targetUrl) {
                 ...forwardRes.headers,
                 'x-proxy-server': 'GPS-Proxy/1.0',
                 'x-response-time': `${responseTime}ms`,
-                'x-cache-status': 'MISS'
+                'x-cache-status': 'MISS',
+                'x-gps-detected': isGPSDevice ? 'true' : 'false'
             };
             
             res.writeHead(forwardRes.statusCode, responseHeaders);
@@ -246,12 +307,12 @@ async function forwardRequest(req, res, targetUrl) {
         });
         
         // Send request body if present
-        if (buffer.length > 0) {
+        if (buffer && buffer.length > 0) {
             forwardReq.write(buffer);
         }
         
         forwardReq.end();
-    });
+    }
     
     // Handle request errors
     req.on('error', (error) => {
@@ -273,6 +334,12 @@ function handleHealthCheck(req, res) {
             port: CONFIG.PORT,
             cacheEnabled: CONFIG.ENABLE_CACHE,
             cacheSize: requestCache.size
+        },
+        stats: {
+            totalRequests: requestCount,
+            gpsRequests: gpsRequestCount,
+            cacheHits: cacheHits,
+            cacheMisses: cacheMisses
         }
     };
     
@@ -299,17 +366,11 @@ function handleStats(req, res) {
     res.end(JSON.stringify(stats, null, 2));
 }
 
-// Counters
-let requestCount = 0;
-let gpsRequestCount = 0;
-let cacheHits = 0;
-let cacheMisses = 0;
-
-// Create HTTP server
+// Create HTTP server with GPS detection
 const server = http.createServer((req, res) => {
     requestCount++;
     
-    // Handle special endpoints
+    // Handle special endpoints FIRST
     if (req.url === '/health' && req.method === 'GET') {
         return handleHealthCheck(req, res);
     }
@@ -325,8 +386,82 @@ const server = http.createServer((req, res) => {
         return;
     }
     
-    // Forward all other requests
-    forwardRequest(req, res, CONFIG.TARGET_SERVER + req.url);
+    // Collect request body to detect GPS data
+    let bodyChunks = [];
+    let bodySize = 0;
+    let isGPSRequest = false;
+    let gpsProtocol = 'UNKNOWN';
+    
+    req.on('data', (chunk) => {
+        bodySize += chunk.length;
+        
+        // Prevent oversized requests
+        if (bodySize > CONFIG.MAX_BODY_SIZE) {
+            log(`Request too large: ${bodySize} bytes`, 'ERROR');
+            res.writeHead(413, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Request too large' }));
+            req.destroy();
+            return;
+        }
+        
+        bodyChunks.push(chunk);
+        
+        // Check first chunk for GPS patterns
+        if (bodyChunks.length === 1) {
+            const buffer = Buffer.concat(bodyChunks);
+            gpsProtocol = detectGPSProtocol(buffer);
+            
+            const contentType = req.headers['content-type'] || '';
+            const userAgent = req.headers['user-agent'] || '';
+            
+            // Detect GPS request
+            isGPSRequest = 
+                gpsProtocol !== 'UNKNOWN' ||
+                contentType.includes('application/octet-stream') ||
+                contentType.includes('text/plain') ||
+                req.method === 'POST' ||
+                userAgent.includes('GPS') ||
+                userAgent.includes('Tracker') ||
+                userAgent.includes('GT') ||
+                req.url === '/' ||
+                req.url === '' ||
+                req.headers['x-gps-protocol'];
+            
+            if (isGPSRequest) {
+                log(`📡 GPS Device detected! Protocol: ${gpsProtocol}`, 'GPS');
+            }
+        }
+    });
+    
+    req.on('end', () => {
+        const bodyBuffer = bodyChunks.length > 0 ? Buffer.concat(bodyChunks) : Buffer.alloc(0);
+        
+        // Determine target URL
+        let targetUrl = CONFIG.TARGET_SERVER + req.url;
+        
+        // If GPS request, redirect to /api/gps
+        if (isGPSRequest) {
+            targetUrl = CONFIG.TARGET_SERVER + '/api/gps';
+            log(`🎯 Redirecting GPS data to: ${targetUrl}`, 'GPS');
+            log(`   Data size: ${bodyBuffer.length} bytes, Protocol: ${gpsProtocol}`, 'GPS-DATA');
+            
+            // Log GPS data sample for debugging
+            if (bodyBuffer.length > 0) {
+                const sample = bodyBuffer.toString('hex', 0, Math.min(100, bodyBuffer.length));
+                log(`   Data sample (hex): ${sample}${bodyBuffer.length > 100 ? '...' : ''}`, 'GPS-DATA');
+            }
+        }
+        
+        // Forward the request with collected body
+        forwardRequest(req, res, targetUrl, bodyBuffer);
+    });
+    
+    // Handle request errors
+    req.on('error', (error) => {
+        log(`✗ REQUEST ERROR: ${error.message}`, 'ERROR');
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Bad Request' }));
+    });
 });
 
 // Graceful shutdown
@@ -354,9 +489,11 @@ server.listen(CONFIG.PORT, '0.0.0.0', () => {
     // Display connection info
     console.log('\n=== GPS PROXY CONFIGURATION ===');
     console.log(`Local URL: http://localhost:${CONFIG.PORT}`);
+    console.log(`External URL: https://gps-proxy-server.onrender.com`);
     console.log(`Target: ${CONFIG.TARGET_SERVER}`);
-    console.log(`Health Check: http://localhost:${CONFIG.PORT}/health`);
-    console.log(`Stats: http://localhost:${CONFIG.PORT}/stats`);
+    console.log(`Health Check: https://gps-proxy-server.onrender.com/health`);
+    console.log(`Stats: https://gps-proxy-server.onrender.com/stats`);
+    console.log(`GPS Devices: Configure with IP: 216.24.57.251 Port: 443`);
     console.log('==============================\n');
 });
 
