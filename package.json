@@ -1,0 +1,20 @@
+{
+  "name": "gps-proxy-server",
+  "version": "1.0.0",
+  "description": "Proxy server for GPS devices with static IP",
+  "main": "proxy.js",
+  "scripts": {
+    "start": "node proxy.js",
+    "dev": "nodemon proxy.js",
+    "test": "node test-proxy.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.0.0"
+  },
+  "devDependencies": {
+    "nodemon": "^2.0.0"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}
